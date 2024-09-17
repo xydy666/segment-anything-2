@@ -99,7 +99,7 @@ ann_obj_id = 1  # give a unique id to each object we interact with (it can be an
 
 # Let's add a 2nd positive click at (x, y) = (250, 220) to refine the mask
 # sending all clicks (and their labels) to `add_new_points_or_box`
-points = np.array([[1300, 420]], dtype=np.float32)
+points = np.array([[600, 600]], dtype=np.float32)
 # for labels, `1` means positive click and `0` means negative click
 labels = np.array([1], np.int32)
 _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(

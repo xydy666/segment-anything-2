@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import ipdb.stdout
 import torch
 import torch.distributed
 import torch.nn.functional as F
@@ -14,6 +15,11 @@ from sam2.modeling.sam.mask_decoder import MaskDecoder
 from sam2.modeling.sam.prompt_encoder import PromptEncoder
 from sam2.modeling.sam.transformer import TwoWayTransformer
 from sam2.modeling.sam2_utils import get_1d_sine_pe, MLP, select_closest_cond_frames
+
+import tensorrt as trt
+import numpy as np
+from cuda import cudart
+import os
 
 # a large negative value as a placeholder score for missing objects
 NO_OBJ_SCORE = -1024.0
@@ -403,36 +409,161 @@ class SAM2Base(torch.nn.Module):
             masks_enable = torch.tensor([1], dtype=torch.int)
 
         if import_from_onnx:
-            print("begin prompt encoder onnx")
-            if sam_mask_prompt != None:
-                raise("currently not supported mask prompt")
             import onnxruntime
-            if self.prompt_encoder_onnx == None:
-                self.prompt_encoder_onnx = onnxruntime.InferenceSession("model/prompt_encoder_"+model_id+".onnx")
-            sparse_embeddings, dense_embeddings, dense_pe = self.prompt_encoder_onnx.run(None, {"coords":sam_point_coords.numpy(), "labels":sam_point_labels.numpy(), "masks":mask_input_dummy.numpy(), "masks_enable":masks_enable.numpy()})
+            # print("begin prompt encoder onnx")
+            # if sam_mask_prompt != None:
+            #     raise("currently not supported mask prompt")
+            # if self.prompt_encoder_onnx == None:
+            #     self.prompt_encoder_onnx = onnxruntime.InferenceSession("model/prompt_encoder_"+model_id+".onnx")
+            # (sparse_embeddings, 
+            #  dense_embeddings, 
+            #  dense_pe) = self.prompt_encoder_onnx.run(None, 
+            #                                           {"coords":sam_point_coords.numpy(), 
+            #                                            "labels":sam_point_labels.numpy(), 
+            #                                            "masks":mask_input_dummy.numpy(), 
+            #                                            "masks_enable":masks_enable.numpy()})
+            # import ipdb;ipdb.set_trace()
+            logger = trt.Logger(trt.Logger.ERROR)
+            trt_file = f"model/prompt_encoder_"+model_id+".trt"
+            if os.path.isfile(trt_file):                                               
+                with open(trt_file, "rb") as f:
+                    engineString = f.read()
+                if engineString == None:
+                    print("Fail getting serialized engine")
+                    return
+                print("Succeed getting serialized engine")
+            engine = trt.Runtime(logger).deserialize_cuda_engine(engineString)
+            if engine == None:
+                print("Fail building engine")
+                return
+            print("Succeed building engine")
+            nIO = engine.num_io_tensors 
+            lTensorName = [engine.get_tensor_name(i) for i in range(nIO)] 
+            nInput = [engine.get_tensor_mode(lTensorName[i]) for i in range(nIO)].count(trt.TensorIOMode.INPUT)  # get the count of input tensor
+            context = engine.create_execution_context()
+            context.set_input_shape('coords', [1, 1, 2])
+            context.set_input_shape('labels', [1, 1])
+            context.set_input_shape('masks', [1, 256, 256])
+            context.set_input_shape('masks_enable', [1])
+            for i in range(nIO):
+                print("[%2d]%s->" % (i, "Input " if i < nInput else "Output"), engine.get_tensor_dtype(lTensorName[i]), engine.get_tensor_shape(lTensorName[i]), context.get_tensor_shape(lTensorName[i]), lTensorName[i])
+            bufferH = []
+            bufferH.append(np.ascontiguousarray(sam_point_coords.numpy()))
+            bufferH.append(np.ascontiguousarray(sam_point_labels.numpy()))
+            bufferH.append(np.ascontiguousarray(mask_input_dummy.numpy()))
+            bufferH.append(np.ascontiguousarray(masks_enable.numpy()))
+            for i in range(nInput, nIO):
+                bufferH.append(np.empty(context.get_tensor_shape(lTensorName[i]), dtype=trt.nptype(engine.get_tensor_dtype(lTensorName[i]))))
+            bufferD = []
+            for i in range(nIO):
+                bufferD.append(cudart.cudaMalloc(bufferH[i].nbytes)[1])
+            for i in range(nInput):                                                     # copy input data from host buffer into device buffer
+                cudart.cudaMemcpy(bufferD[i], bufferH[i].ctypes.data, bufferH[i].nbytes, cudart.cudaMemcpyKind.cudaMemcpyHostToDevice)
+
+            for i in range(nIO):
+                context.set_tensor_address(lTensorName[i], int(bufferD[i]))             # set address of all input and output data in device buffer
+
+            context.execute_async_v3(0)      
+            for i in range(nInput, nIO):                                                # copy output data from device buffer into host buffer
+                cudart.cudaMemcpy(bufferH[i].ctypes.data, bufferD[i], bufferH[i].nbytes, cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost)
+
+            trt_output = {}
+            for i in range(nIO):
+                trt_output[lTensorName[i]] = bufferH[i]
+                print(lTensorName[i])
+                print(bufferH[i].shape)
+                
+            sparse_embeddings = trt_output["sparse_embeddings"]
+            dense_embeddings = trt_output["dense_embeddings"]
+            dense_pe = trt_output["dense_pe"]
+            for b in bufferD:                                                           # free the GPU memory buffer after all work
+                cudart.cudaFree(b)
+
             sparse_embeddings = torch.Tensor(sparse_embeddings)
             dense_embeddings = torch.Tensor(dense_embeddings)
             dense_pe = torch.Tensor(dense_pe)
 
-            if self.mask_decoder_onnx == None:
-                self.mask_decoder_onnx  = onnxruntime.InferenceSession("model/mask_decoder_"+model_id+".onnx")
-           # print("backbone_features", backbone_features.shape)
-            print("begin mask decoder onnx")
-            print("begin mask decoder onnx")
-            print("backbone_features", np.sum(backbone_features.numpy()))
-            print("image_pe", np.sum(dense_pe.numpy()))
-            print("sparse_embeddings", np.sum(sparse_embeddings.numpy()))
-            print("dense_embeddings", np.sum(dense_embeddings.numpy()))
-            print("high_res_features", np.sum(high_res_features[0].numpy()))
-            print("high_res_features", np.sum(high_res_features[1].numpy()))
-            masks, iou_pred, sam_tokens_out, object_score_logits  = self.mask_decoder_onnx.run(None, {
-                "image_embeddings":backbone_features.numpy(),
-                "image_pe": dense_pe.numpy(),
-                "sparse_prompt_embeddings": sparse_embeddings.numpy(),
-                "dense_prompt_embeddings": dense_embeddings.numpy(),
-                #repeat_image=False,  # the image is already batched
-                "high_res_features1":high_res_features[0].numpy(),
-                "high_res_features2":high_res_features[1].numpy()})
+        #     if self.mask_decoder_onnx == None:
+        #         self.mask_decoder_onnx  = onnxruntime.InferenceSession("model/mask_decoder_"+model_id+".onnx")
+        #    # print("backbone_features", backbone_features.shape)
+        #     print("begin mask decoder onnx")
+        #     print("begin mask decoder onnx")
+        #     print("backbone_features", np.sum(backbone_features.numpy()))
+        #     print("image_pe", np.sum(dense_pe.numpy()))
+        #     print("sparse_embeddings", np.sum(sparse_embeddings.numpy()))
+        #     print("dense_embeddings", np.sum(dense_embeddings.numpy()))
+        #     print("high_res_features", np.sum(high_res_features[0].numpy()))
+        #     print("high_res_features", np.sum(high_res_features[1].numpy()))
+        #     masks, iou_pred, sam_tokens_out, object_score_logits  = self.mask_decoder_onnx.run(None, {
+        #         "image_embeddings":backbone_features.numpy(),
+        #         "image_pe": dense_pe.numpy(),
+        #         "sparse_prompt_embeddings": sparse_embeddings.numpy(),
+        #         "dense_prompt_embeddings": dense_embeddings.numpy(),
+        #         #repeat_image=False,  # the image is already batched
+        #         "high_res_features1":high_res_features[0].numpy(),
+        #         "high_res_features2":high_res_features[1].numpy()})
+            # import ipdb; ipdb.set_trace()
+            logger = trt.Logger(trt.Logger.ERROR)
+            trt_file = f"model/mask_decoder_"+model_id+".trt"
+            if os.path.isfile(trt_file):                                               
+                with open(trt_file, "rb") as f:
+                    engineString = f.read()
+                if engineString == None:
+                    print("Fail getting serialized engine")
+                    return
+                print("Succeed getting serialized engine")
+            engine = trt.Runtime(logger).deserialize_cuda_engine(engineString)
+            if engine == None:
+                print("Fail building engine")
+                return
+            print("Succeed building engine")
+            nIO = engine.num_io_tensors 
+            lTensorName = [engine.get_tensor_name(i) for i in range(nIO)] 
+            nInput = [engine.get_tensor_mode(lTensorName[i]) for i in range(nIO)].count(trt.TensorIOMode.INPUT)  # get the count of input tensor
+            context = engine.create_execution_context()
+            context.set_input_shape('image_embeddings', [1, 256, 64, 64])
+            context.set_input_shape('image_pe', [1, 256, 64, 64])
+            context.set_input_shape('sparse_prompt_embeddings', [1, 2, 256])
+            context.set_input_shape('dense_prompt_embeddings', [1, 256, 64, 64])
+            context.set_input_shape('high_res_features1', [1, 32, 256, 256])
+            context.set_input_shape('high_res_features2', [1, 64, 128, 128])
+            for i in range(nIO):
+                print("[%2d]%s->" % (i, "Input " if i < nInput else "Output"), engine.get_tensor_dtype(lTensorName[i]), engine.get_tensor_shape(lTensorName[i]), context.get_tensor_shape(lTensorName[i]), lTensorName[i])
+            bufferH = []
+            bufferH.append(np.ascontiguousarray(backbone_features.numpy()))
+            bufferH.append(np.ascontiguousarray(dense_pe.numpy()))
+            bufferH.append(np.ascontiguousarray(sparse_embeddings.numpy()))
+            bufferH.append(np.ascontiguousarray(dense_embeddings.numpy()))
+            bufferH.append(np.ascontiguousarray(high_res_features[0].numpy()))
+            bufferH.append(np.ascontiguousarray(high_res_features[1].numpy()))
+            for i in range(nInput, nIO):
+                bufferH.append(np.empty(context.get_tensor_shape(lTensorName[i]), dtype=trt.nptype(engine.get_tensor_dtype(lTensorName[i]))))
+            bufferD = []
+            for i in range(nIO):
+                bufferD.append(cudart.cudaMalloc(bufferH[i].nbytes)[1])
+            for i in range(nInput):                                                     # copy input data from host buffer into device buffer
+                cudart.cudaMemcpy(bufferD[i], bufferH[i].ctypes.data, bufferH[i].nbytes, cudart.cudaMemcpyKind.cudaMemcpyHostToDevice)
+
+            for i in range(nIO):
+                context.set_tensor_address(lTensorName[i], int(bufferD[i]))             # set address of all input and output data in device buffer
+
+            context.execute_async_v3(0)      
+            for i in range(nInput, nIO):                                                # copy output data from device buffer into host buffer
+                cudart.cudaMemcpy(bufferH[i].ctypes.data, bufferD[i], bufferH[i].nbytes, cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost)
+
+            trt_output = {}
+            for i in range(nIO):
+                trt_output[lTensorName[i]] = bufferH[i]
+                print(lTensorName[i])
+                print(bufferH[i].shape)
+                
+            masks = trt_output["masks"]
+            iou_pred = trt_output["iou_pred"]
+            sam_tokens_out = trt_output["sam_tokens_out"]
+            object_score_logits = trt_output["object_score_logits"]
+            for b in bufferD:                                                           # free the GPU memory buffer after all work
+                cudart.cudaFree(b) 
+            
             masks = torch.Tensor(masks)
             iou_pred = torch.Tensor(iou_pred)
             sam_tokens_out = torch.Tensor(sam_tokens_out)
@@ -588,11 +719,61 @@ class SAM2Base(torch.nn.Module):
             )
 
         if import_from_onnx:
-            import onnxruntime
-            if self.mlp_onnx == None:
-                self.mlp_onnx  = onnxruntime.InferenceSession("model/mlp_"+model_id+".onnx")
-            import numpy as np
-            obj_ptr = self.mlp_onnx.run(None, {"x":sam_output_token.numpy()})[0]
+            # import onnxruntime
+            # if self.mlp_onnx == None:
+            #     self.mlp_onnx  = onnxruntime.InferenceSession("model/mlp_"+model_id+".onnx")
+            # import numpy as np
+            # obj_ptr = self.mlp_onnx.run(None, {"x":sam_output_token.numpy()})[0]
+            # import ipdb; ipdb.set_trace()
+            logger = trt.Logger(trt.Logger.ERROR)
+            trt_file = f"model/mlp_"+model_id+".trt"
+            if os.path.isfile(trt_file):                                               
+                with open(trt_file, "rb") as f:
+                    engineString = f.read()
+                if engineString == None:
+                    print("Fail getting serialized engine")
+                    return
+                print("Succeed getting serialized engine")
+            engine = trt.Runtime(logger).deserialize_cuda_engine(engineString)
+            if engine == None:
+                print("Fail building engine")
+                return
+            print("Succeed building engine")
+            nIO = engine.num_io_tensors 
+            lTensorName = [engine.get_tensor_name(i) for i in range(nIO)] 
+            nInput = [engine.get_tensor_mode(lTensorName[i]) for i in range(nIO)].count(trt.TensorIOMode.INPUT)  # get the count of input tensor
+            context = engine.create_execution_context()
+            context.set_input_shape('x', [1, 256])
+            for i in range(nIO):
+                print("[%2d]%s->" % (i, "Input " if i < nInput else "Output"), engine.get_tensor_dtype(lTensorName[i]), engine.get_tensor_shape(lTensorName[i]), context.get_tensor_shape(lTensorName[i]), lTensorName[i])
+            bufferH = []
+            bufferH.append(np.ascontiguousarray(sam_output_token.numpy()))
+            for i in range(nInput, nIO):
+                bufferH.append(np.empty(context.get_tensor_shape(lTensorName[i]), dtype=trt.nptype(engine.get_tensor_dtype(lTensorName[i]))))
+            bufferD = []
+            for i in range(nIO):
+                bufferD.append(cudart.cudaMalloc(bufferH[i].nbytes)[1])
+            for i in range(nInput):                                                     # copy input data from host buffer into device buffer
+                cudart.cudaMemcpy(bufferD[i], bufferH[i].ctypes.data, bufferH[i].nbytes, cudart.cudaMemcpyKind.cudaMemcpyHostToDevice)
+
+            for i in range(nIO):
+                context.set_tensor_address(lTensorName[i], int(bufferD[i]))             # set address of all input and output data in device buffer
+
+            context.execute_async_v3(0)      
+            for i in range(nInput, nIO):                                                # copy output data from device buffer into host buffer
+                cudart.cudaMemcpy(bufferH[i].ctypes.data, bufferD[i], bufferH[i].nbytes, cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost)
+
+            trt_output = {}
+            for i in range(nIO):
+                trt_output[lTensorName[i]] = bufferH[i]
+                print(lTensorName[i])
+                print(bufferH[i].shape)
+                
+            obj_ptr = trt_output["x_out"]
+
+            for b in bufferD:                                                           # free the GPU memory buffer after all work
+                cudart.cudaFree(b) 
+            
             obj_ptr = torch.Tensor(obj_ptr)
         
         if export_to_tflite and not self.mlp_tflite_exported:
@@ -944,20 +1125,84 @@ class SAM2Base(torch.nn.Module):
             #onnx_program.save('model/memory_attention_'+model_id+'.onnx')
 
         if import_from_onnx:
-            print("begin memory attention onnx")
-            import onnxruntime
-            if self.memory_attention_onnx == None:
-                self.memory_attention_onnx = onnxruntime.InferenceSession("model/memory_attention_"+model_id+".opt.onnx")
-            import numpy as np
-            #num_obj_ptr_tokens_numpy = np.array((num_obj_ptr_tokens)).astype(np.int64)
-            #print("curr", np.sum(current_vision_feats[0].numpy()))
-            #print("memory", np.sum(memory.numpy()))
-            #print("curr_pos", np.sum(current_vision_pos_embeds[0].numpy()))
-            #print("memory_pos", np.sum(memory_pos_embed.numpy()))
-            #print("num_obj_ptr_tokens", np.sum(num_obj_ptr_tokens_numpy))
+            # print("begin memory attention onnx")
+            # import onnxruntime
+            # if self.memory_attention_onnx == None:
+            #     self.memory_attention_onnx = onnxruntime.InferenceSession("model/memory_attention_"+model_id+".opt.onnx")
+            # import numpy as np
+            # #num_obj_ptr_tokens_numpy = np.array((num_obj_ptr_tokens)).astype(np.int64)
+            # #print("curr", np.sum(current_vision_feats[0].numpy()))
+            # #print("memory", np.sum(memory.numpy()))
+            # #print("curr_pos", np.sum(current_vision_pos_embeds[0].numpy()))
+            # #print("memory_pos", np.sum(memory_pos_embed.numpy()))
+            # #print("num_obj_ptr_tokens", np.sum(num_obj_ptr_tokens_numpy))
 
-            pix_feat_with_mem = self.memory_attention_onnx.run(None, {"curr":current_vision_feats[0].numpy(), "memory_1":memory_1.numpy(), "memory_2":memory_2.numpy(), "curr_pos":current_vision_pos_embeds[0].numpy(), "memory_pos_1":memory_pos_embed_1.numpy(), "memory_pos_2":memory_pos_embed_2.numpy()})
-            pix_feat_with_mem = torch.Tensor(pix_feat_with_mem[0])
+            # pix_feat_with_mem = self.memory_attention_onnx.run(None, 
+            #                                                    {"curr":current_vision_feats[0].numpy(), 
+            #                                                     "memory_1":memory_1.numpy(), 
+            #                                                     "memory_2":memory_2.numpy(), 
+            #                                                     "curr_pos":current_vision_pos_embeds[0].numpy(), 
+            #                                                     "memory_pos_1":memory_pos_embed_1.numpy(), 
+            #                                                     "memory_pos_2":memory_pos_embed_2.numpy()})
+            
+            logger = trt.Logger(trt.Logger.ERROR)
+            trt_file = f"model/memory_attention_"+model_id+".opt.trt"
+            if os.path.isfile(trt_file):                                               
+                with open(trt_file, "rb") as f:
+                    engineString = f.read()
+                if engineString == None:
+                    print("Fail getting serialized engine")
+                    return
+                print("Succeed getting serialized engine")
+            engine = trt.Runtime(logger).deserialize_cuda_engine(engineString)
+            if engine == None:
+                print("Fail building engine")
+                return
+            print("Succeed building engine")
+            nIO = engine.num_io_tensors 
+            lTensorName = [engine.get_tensor_name(i) for i in range(nIO)] 
+            nInput = [engine.get_tensor_mode(lTensorName[i]) for i in range(nIO)].count(trt.TensorIOMode.INPUT)  # get the count of input tensor
+            context = engine.create_execution_context()
+            context.set_input_shape('curr', current_vision_feats[0].shape)
+            context.set_input_shape('memory_1', memory_1.shape)
+            context.set_input_shape('memory_2', memory_2.shape)
+            context.set_input_shape('curr_pos', current_vision_pos_embeds[0].shape)
+            context.set_input_shape('memory_pos_1', memory_pos_embed_1.shape)
+            context.set_input_shape('memory_pos_2', memory_pos_embed_2.shape)
+            for i in range(nIO):
+                print("[%2d]%s->" % (i, "Input " if i < nInput else "Output"), engine.get_tensor_dtype(lTensorName[i]), engine.get_tensor_shape(lTensorName[i]), context.get_tensor_shape(lTensorName[i]), lTensorName[i])
+            bufferH = []
+            bufferH.append(np.ascontiguousarray(current_vision_feats[0].numpy()))
+            bufferH.append(np.ascontiguousarray(memory_1.numpy()))
+            bufferH.append(np.ascontiguousarray(memory_2.numpy()))
+            bufferH.append(np.ascontiguousarray(current_vision_pos_embeds[0].numpy()))
+            bufferH.append(np.ascontiguousarray(memory_pos_embed_1.numpy()))
+            bufferH.append(np.ascontiguousarray(memory_pos_embed_2.numpy()))
+            for i in range(nInput, nIO):
+                bufferH.append(np.empty(context.get_tensor_shape(lTensorName[i]), dtype=trt.nptype(engine.get_tensor_dtype(lTensorName[i]))))
+            bufferD = []
+            for i in range(nIO):
+                bufferD.append(cudart.cudaMalloc(bufferH[i].nbytes)[1])
+            for i in range(nInput):                                                     # copy input data from host buffer into device buffer
+                cudart.cudaMemcpy(bufferD[i], bufferH[i].ctypes.data, bufferH[i].nbytes, cudart.cudaMemcpyKind.cudaMemcpyHostToDevice)
+
+            for i in range(nIO):
+                context.set_tensor_address(lTensorName[i], int(bufferD[i]))             # set address of all input and output data in device buffer
+
+            context.execute_async_v3(0)      
+            for i in range(nInput, nIO):                                                # copy output data from device buffer into host buffer
+                cudart.cudaMemcpy(bufferH[i].ctypes.data, bufferD[i], bufferH[i].nbytes, cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost)
+
+            trt_output = {}
+            for i in range(nIO):
+                trt_output[lTensorName[i]] = bufferH[i]
+                print(lTensorName[i])
+                print(bufferH[i].shape)
+                
+            pix_feat_with_mem = trt_output["pix_feat"]
+            for b in bufferD:                                                           # free the GPU memory buffer after all work
+                cudart.cudaFree(b)
+            pix_feat_with_mem = torch.Tensor(pix_feat_with_mem)
         
         if not import_from_onnx and not import_from_tflite:
             #print("begin memory attention torch")
@@ -1026,11 +1271,66 @@ class SAM2Base(torch.nn.Module):
             )
 
         if import_from_onnx:
-            print("begin memory encoder onnx")
-            import onnxruntime
-            if self.memory_encoder_onnx == None:
-                self.memory_encoder_onnx = onnxruntime.InferenceSession("model/memory_encoder_"+model_id+".onnx")
-            vision_features, vision_pos_enc = self.memory_encoder_onnx.run(None, {"pix_feat":pix_feat.numpy(), "masks":mask_for_mem.numpy()})
+            # print("begin memory encoder onnx")
+            # import onnxruntime
+            # if self.memory_encoder_onnx == None:
+            #     self.memory_encoder_onnx = onnxruntime.InferenceSession("model/memory_encoder_"+model_id+".onnx")
+            # vision_features, vision_pos_enc = self.memory_encoder_onnx.run(None, {"pix_feat":pix_feat.numpy(), "masks":mask_for_mem.numpy()})
+            
+            # import ipdb; ipdb.set_trace()
+            logger = trt.Logger(trt.Logger.ERROR)
+            trt_file = f"model/memory_encoder_"+model_id+".trt"
+            if os.path.isfile(trt_file):                                               
+                with open(trt_file, "rb") as f:
+                    engineString = f.read()
+                if engineString == None:
+                    print("Fail getting serialized engine")
+                    return
+                print("Succeed getting serialized engine")
+            engine = trt.Runtime(logger).deserialize_cuda_engine(engineString)
+            if engine == None:
+                print("Fail building engine")
+                return
+            print("Succeed building engine")
+            nIO = engine.num_io_tensors 
+            lTensorName = [engine.get_tensor_name(i) for i in range(nIO)] 
+            nInput = [engine.get_tensor_mode(lTensorName[i]) for i in range(nIO)].count(trt.TensorIOMode.INPUT)  # get the count of input tensor
+            context = engine.create_execution_context()
+            context.set_input_shape('pix_feat', [1, 256, 64, 64])
+            context.set_input_shape('masks', [1, 1, 1024, 1024])
+            
+            for i in range(nIO):
+                print("[%2d]%s->" % (i, "Input " if i < nInput else "Output"), engine.get_tensor_dtype(lTensorName[i]), engine.get_tensor_shape(lTensorName[i]), context.get_tensor_shape(lTensorName[i]), lTensorName[i])
+            bufferH = []
+            bufferH.append(np.ascontiguousarray(pix_feat.numpy()))
+            bufferH.append(np.ascontiguousarray(mask_for_mem.numpy()))
+
+            for i in range(nInput, nIO):
+                bufferH.append(np.empty(context.get_tensor_shape(lTensorName[i]), dtype=trt.nptype(engine.get_tensor_dtype(lTensorName[i]))))
+            bufferD = []
+            for i in range(nIO):
+                bufferD.append(cudart.cudaMalloc(bufferH[i].nbytes)[1])
+            for i in range(nInput):                                                     # copy input data from host buffer into device buffer
+                cudart.cudaMemcpy(bufferD[i], bufferH[i].ctypes.data, bufferH[i].nbytes, cudart.cudaMemcpyKind.cudaMemcpyHostToDevice)
+
+            for i in range(nIO):
+                context.set_tensor_address(lTensorName[i], int(bufferD[i]))             # set address of all input and output data in device buffer
+
+            context.execute_async_v3(0)      
+            for i in range(nInput, nIO):                                                # copy output data from device buffer into host buffer
+                cudart.cudaMemcpy(bufferH[i].ctypes.data, bufferD[i], bufferH[i].nbytes, cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost)
+
+            trt_output = {}
+            for i in range(nIO):
+                trt_output[lTensorName[i]] = bufferH[i]
+                print(lTensorName[i])
+                print(bufferH[i].shape)
+                
+            vision_features = trt_output["vision_features"]
+            vision_pos_enc = trt_output["vision_pos_enc"]
+            for b in bufferD:                                                           # free the GPU memory buffer after all work
+                cudart.cudaFree(b)     
+            
             vision_features = torch.Tensor(vision_features)
             vision_pos_enc = torch.Tensor(vision_pos_enc)
 

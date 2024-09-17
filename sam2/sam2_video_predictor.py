@@ -14,6 +14,10 @@ from tqdm import tqdm
 from sam2.modeling.sam2_base import NO_OBJ_SCORE, SAM2Base
 from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video_frames
 
+import tensorrt as trt
+from cuda import cudart
+import os
+import numpy as np
 
 class SAM2VideoPredictor(SAM2Base):
     """The predictor class to handle user interactions and manage inference states."""
@@ -854,13 +858,72 @@ class SAM2VideoPredictor(SAM2Base):
             device = inference_state["device"]
             image = inference_state["images"][frame_idx].to(device).float().unsqueeze(0)
             if import_from_onnx:
-                print("begin image encoder onnx")
-                print(image.shape)
-                import onnxruntime
-                if self.image_encoder_onnx == None:
-                    self.image_encoder_onnx = onnxruntime.InferenceSession("model/image_encoder_"+model_id+".onnx")
-                vision_features, vision_pos_enc_0, vision_pos_enc_1, vision_pos_enc_2, backbone_fpn_0, backbone_fpn_1, backbone_fpn_2 = self.image_encoder_onnx.run(None, {"input_image":image.numpy()})
-            
+                # print("begin image encoder onnx")
+                # print(image.shape)
+                # import onnxruntime
+                # if self.image_encoder_onnx == None:
+                #     self.image_encoder_onnx = onnxruntime.InferenceSession("model/image_encoder_"+model_id+".onnx")
+                # vision_features, vision_pos_enc_0, vision_pos_enc_1, vision_pos_enc_2, backbone_fpn_0, backbone_fpn_1, backbone_fpn_2 = self.image_encoder_onnx.run(None, {"input_image":image.numpy()})
+                # print("vision_features", vision_features.shape)
+                # print("vision_pos_enc_0", vision_pos_enc_0.shape)
+                # print("vision_pos_enc_1", vision_pos_enc_1.shape)
+                # print("vision_pos_enc_2", vision_pos_enc_2.shape)
+                # print("backbone_fpn_0", backbone_fpn_0.shape)
+                # print("backbone_fpn_1", backbone_fpn_1.shape)
+                # print("backbone_fpn_2", backbone_fpn_2.shape)
+                logger = trt.Logger(trt.Logger.ERROR)
+                trt_file = f"model/image_encoder_"+model_id+".trt"
+                if os.path.isfile(trt_file):                                               
+                    with open(trt_file, "rb") as f:
+                        engineString = f.read()
+                    if engineString == None:
+                        print("Fail getting serialized engine")
+                        return
+                    print("Succeed getting serialized engine")
+                engine = trt.Runtime(logger).deserialize_cuda_engine(engineString)
+                if engine == None:
+                    print("Fail building engine")
+                    return
+                print("Succeed building engine")
+                nIO = engine.num_io_tensors 
+                lTensorName = [engine.get_tensor_name(i) for i in range(nIO)] 
+                nInput = [engine.get_tensor_mode(lTensorName[i]) for i in range(nIO)].count(trt.TensorIOMode.INPUT)  # get the count of input tensor
+                context = engine.create_execution_context()
+                context.set_input_shape(lTensorName[0], [1, 3, 1024, 1024])
+                for i in range(nIO):
+                    print("[%2d]%s->" % (i, "Input " if i < nInput else "Output"), engine.get_tensor_dtype(lTensorName[i]), engine.get_tensor_shape(lTensorName[i]), context.get_tensor_shape(lTensorName[i]), lTensorName[i])
+                bufferH = []
+                bufferH.append(np.ascontiguousarray(image.numpy()))
+                for i in range(nInput, nIO):
+                    bufferH.append(np.empty(context.get_tensor_shape(lTensorName[i]), dtype=trt.nptype(engine.get_tensor_dtype(lTensorName[i]))))
+                bufferD = []
+                for i in range(nIO):
+                    bufferD.append(cudart.cudaMalloc(bufferH[i].nbytes)[1])
+                for i in range(nInput):                                                     # copy input data from host buffer into device buffer
+                    cudart.cudaMemcpy(bufferD[i], bufferH[i].ctypes.data, bufferH[i].nbytes, cudart.cudaMemcpyKind.cudaMemcpyHostToDevice)
+
+                for i in range(nIO):
+                    context.set_tensor_address(lTensorName[i], int(bufferD[i]))             # set address of all input and output data in device buffer
+
+                context.execute_async_v3(0)      
+                for i in range(nInput, nIO):                                                # copy output data from device buffer into host buffer
+                    cudart.cudaMemcpy(bufferH[i].ctypes.data, bufferD[i], bufferH[i].nbytes, cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost)
+
+                trt_output = {}
+                for i in range(nIO):
+                    trt_output[lTensorName[i]] = bufferH[i]
+                    print(lTensorName[i])
+                    print(bufferH[i].shape)
+                    
+                vision_features = trt_output["vision_features"]
+                vision_pos_enc_0 = trt_output["vision_pos_enc_0"]
+                vision_pos_enc_1 = trt_output["vision_pos_enc_1"]
+                vision_pos_enc_2 = trt_output["vision_pos_enc_2"]
+                backbone_fpn_0 = trt_output["backbone_fpn_0"]
+                backbone_fpn_1 = trt_output["backbone_fpn_1"]
+                backbone_fpn_2 = trt_output["backbone_fpn_2"]
+                for b in bufferD:                                                           # free the GPU memory buffer after all work
+                    cudart.cudaFree(b)
             if import_from_tflite:
                 print("begin image encoder tflite")
                 import tensorflow as tf

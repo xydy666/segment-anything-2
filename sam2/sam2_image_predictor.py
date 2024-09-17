@@ -137,6 +137,7 @@ class SAM2ImagePredictor:
         if import_from_onnx:
             model = onnxruntime.InferenceSession("model/image_encoder_"+model_id+".onnx")
             vision_features, vision_pos_enc_0, vision_pos_enc_1, vision_pos_enc_2, backbone_fpn_0, backbone_fpn_1, backbone_fpn_2 = model.run(None, {"input_image":input_image.numpy()})
+            # print("input_image",input_image.shape)
             print("vision_features", vision_features.shape)
             print("vision_pos_enc_0", vision_pos_enc_0.shape)
             print("vision_pos_enc_1", vision_pos_enc_1.shape)
