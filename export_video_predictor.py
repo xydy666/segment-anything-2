@@ -3,10 +3,10 @@
 
 import argparse
 parser = argparse.ArgumentParser()
-parser.add_argument('--model_id', default="hiera_t", choices=["hiera_l", "hiera_b+", "hiera_s", "hiera_t"])
+parser.add_argument('--model_id', default="hiera_s", choices=["hiera_l", "hiera_b+", "hiera_s", "hiera_t"])
 parser.add_argument('--framework', default="onnx", choices=["onnx", "tflite", "torch"])
 parser.add_argument('--accuracy', default="float", choices=["float", "int8"])
-parser.add_argument('--mode', default="both", choices=["both", "import", "export"])
+parser.add_argument('--mode', default="export", choices=["both", "import", "export"])
 parser.add_argument('--image_size', default=1024, type=int, choices=[512, 1024])
 args = parser.parse_args()
 
@@ -82,7 +82,7 @@ def show_box(box, ax):
     w, h = box[2] - box[0], box[3] - box[1]
     ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0, 0, 0, 0), lw=2))
 
-video_dir = "./notebooks/videos/bedroom_short"
+video_dir = "./notebooks/videos/mport"
 
 # scan all the JPEG frame names in this directory
 frame_names = [
@@ -99,9 +99,9 @@ ann_obj_id = 1  # give a unique id to each object we interact with (it can be an
 
 # Let's add a 2nd positive click at (x, y) = (250, 220) to refine the mask
 # sending all clicks (and their labels) to `add_new_points_or_box`
-points = np.array([[210, 350], [250, 220]], dtype=np.float32)
+points = np.array([[1300, 420]], dtype=np.float32)
 # for labels, `1` means positive click and `0` means negative click
-labels = np.array([1, 1], np.int32)
+labels = np.array([1], np.int32)
 _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
     inference_state=inference_state,
     frame_idx=ann_frame_idx,

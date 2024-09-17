@@ -580,10 +580,10 @@ class SAM2Base(torch.nn.Module):
                 self.obj_ptr_proj, (sam_output_token), 'model/mlp_'+model_id+'.onnx',
                 input_names=["x"],
                 output_names=["x_out"],
-                dynamic_axes={
-                    'x': {0: 'n'},
-                    'obj_ptr': {0: 'n'}
-                },
+                # dynamic_axes={
+                #     'x': {0: 'n'},
+                #     'obj_ptr': {0: 'n'}
+                # },
                 verbose=False, opset_version=17
             )
 
@@ -919,11 +919,11 @@ class SAM2Base(torch.nn.Module):
 
         if export_to_onnx and not self.memory_attention_onnx_exported:
             self.memory_attention_onnx_exported = True
-            #print("current_vision_feats", current_vision_feats[0].shape, current_vision_feats[0].dtype)
-            #print("memory", memory.shape, memory.dtype)
-            #print("current_vision_pos_embeds", current_vision_pos_embeds[0].shape, current_vision_pos_embeds[0].dtype)
-            #print("memory_pos_embed", memory_pos_embed.shape, memory_pos_embed.dtype)
-            #print("num_obj_ptr_tokens", num_obj_ptr_tokens)
+            print("current_vision_feats", current_vision_feats[0].shape, current_vision_feats[0].dtype)
+            print("memory", memory.shape, memory.dtype)
+            print("current_vision_pos_embeds", current_vision_pos_embeds[0].shape, current_vision_pos_embeds[0].dtype)
+            print("memory_pos_embed", memory_pos_embed.shape, memory_pos_embed.dtype)
+            print("num_obj_ptr_tokens", num_obj_ptr_tokens)
             torch.onnx.export(
                 self.memory_attention, (current_vision_feats[0], memory_1, memory_2, current_vision_pos_embeds[0], memory_pos_embed_1, memory_pos_embed_2), 'model/memory_attention_'+model_id+'.opt.onnx',
                 input_names=["curr", "memory_1", "memory_2", "curr_pos", "memory_pos_1", "memory_pos_2"],
@@ -934,6 +934,7 @@ class SAM2Base(torch.nn.Module):
                     'memory_pos_1': {0: 'n_1'},
                     'memory_pos_2': {0: 'n_2'}
                 },
+                do_constant_folding=True,
                 verbose=False, opset_version=17
             )
             #export_options = torch.onnx.ExportOptions(dynamic_shapes=True)
@@ -958,67 +959,6 @@ class SAM2Base(torch.nn.Module):
             pix_feat_with_mem = self.memory_attention_onnx.run(None, {"curr":current_vision_feats[0].numpy(), "memory_1":memory_1.numpy(), "memory_2":memory_2.numpy(), "curr_pos":current_vision_pos_embeds[0].numpy(), "memory_pos_1":memory_pos_embed_1.numpy(), "memory_pos_2":memory_pos_embed_2.numpy()})
             pix_feat_with_mem = torch.Tensor(pix_feat_with_mem[0])
         
-        if export_to_tflite and not self.memory_attention_tflite_exported:
-            self.memory_attention_tflite_exported = True
-            import ai_edge_torch
-            import tensorflow as tf
-            sample_inputs = (current_vision_feats[0], memory_1, memory_2, current_vision_pos_embeds[0], memory_pos_embed_1, memory_pos_embed_2)
-            tfl_converter_flags = {'target_spec': {'supported_ops': [tf.lite.OpsSet.TFLITE_BUILTINS]}}
-            if self.num_maskmem == 1 and self.max_obj_ptrs_in_encoder == 1:
-                edge_model = ai_edge_torch.convert(self.memory_attention, sample_inputs, _ai_edge_converter_flags=tfl_converter_flags)
-            else:
-                n_1 = torch.export.Dim("n_1", min=1, max=256)
-                n_4096 = n_1 * 4096
-                n_2 = torch.export.Dim("n_2", min=1, max=256)
-                n_4 = n_2 * 4
-                dynamic_shapes={
-                    'curr': None,
-                    'memory_1': {0: n_4096},
-                    'memory_2': {0: n_4},
-                    'curr_pos': None,
-                    'memory_pos_1': {0: n_4096},
-                    'memory_pos_2': {0: n_4}
-                }
-                edge_model = ai_edge_torch.convert(self.memory_attention, sample_inputs, _ai_edge_converter_flags=tfl_converter_flags, dynamic_shapes=dynamic_shapes)
-            edge_model.export("model/memory_attention_"+model_id+".tflite")
-
-        if import_from_tflite:
-            import tensorflow as tf
-            import os
-            #os.environ['TF_ENABLE_XNNPACK'] = '0'
-            memory_attention = tf.lite.Interpreter(model_path="model/memory_attention_"+model_id+".tflite")
-            #memory_attention.allocate_tensors()
-            input_details = memory_attention.get_input_details()
-            output_details = memory_attention.get_output_details()
-            memory_attention.resize_tensor_input(
-                input_details[5]["index"], 
-                [memory_1.shape[0], 1, 64]
-            )
-            memory_attention.resize_tensor_input(
-                input_details[1]["index"], 
-                [memory_2.shape[0], 1, 64]
-            )
-            memory_attention.resize_tensor_input(
-                input_details[4]["index"], 
-                [memory_pos_embed_1.shape[0], 1, 64]
-            )
-            memory_attention.resize_tensor_input(
-                input_details[0]["index"], 
-                [memory_pos_embed_2.shape[0], 1, 64]
-            )
-            memory_attention.allocate_tensors()
-
-            memory_attention.set_tensor(input_details[3]["index"], current_vision_feats[0].numpy())
-            memory_attention.set_tensor(input_details[5]["index"], memory_1.numpy())
-            memory_attention.set_tensor(input_details[1]["index"], memory_2.numpy())
-            memory_attention.set_tensor(input_details[2]["index"], current_vision_pos_embeds[0].numpy())
-            memory_attention.set_tensor(input_details[4]["index"], memory_pos_embed_1.numpy())
-            memory_attention.set_tensor(input_details[0]["index"], memory_pos_embed_2.numpy())
-            memory_attention.invoke()
-
-            pix_feat_with_mem = memory_attention.get_tensor(output_details[0]["index"])
-            pix_feat_with_mem = torch.Tensor(pix_feat_with_mem)
-
         if not import_from_onnx and not import_from_tflite:
             #print("begin memory attention torch")
             #print("current_vision_feats", current_vision_feats[0].shape)

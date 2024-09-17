@@ -3,10 +3,10 @@
 
 import argparse
 parser = argparse.ArgumentParser()
-parser.add_argument('--model_id', default="hiera_t", choices=["hiera_l", "hiera_b+", "hiera_s", "hiera_t"])
+parser.add_argument('--model_id', default="hiera_s", choices=["hiera_l", "hiera_b+", "hiera_s", "hiera_t"])
 parser.add_argument('--framework', default="onnx", choices=["onnx", "tflite", "torch"])
 parser.add_argument('--accuracy', default="float", choices=["float", "int8"])
-parser.add_argument('--mode', default="both", choices=["both", "import", "export"])
+parser.add_argument('--mode', default="export", choices=["both", "import", "export"])
 parser.add_argument('--image_size', default=1024, type=int, choices=[512, 1024])
 args = parser.parse_args()
 
@@ -74,7 +74,7 @@ def show_mask(mask, ax, random_color=False, borders = True):
     mask_image =  mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
     if borders:
         import cv2
-        contours, _ = cv2.findContours(mask,cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE) 
+        contours = cv2.findContours(mask,cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE) 
         # Try to smooth contours
         contours = [cv2.approxPolyDP(contour, epsilon=0.01, closed=True) for contour in contours]
         mask_image = cv2.drawContours(mask_image, contours, -1, (1, 1, 1, 0.5), thickness=2) 
@@ -140,6 +140,6 @@ masks = masks[sorted_ind]
 scores = scores[sorted_ind]
 logits = logits[sorted_ind]
 
-show_masks(image, masks, scores, point_coords=input_point, input_labels=input_label, borders=True, model_id=model_id)
+# show_masks(image, masks, scores, point_coords=input_point, input_labels=input_label, borders=True, model_id=model_id)
 
 print("Success!")

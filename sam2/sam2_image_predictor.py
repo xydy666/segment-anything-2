@@ -513,11 +513,11 @@ class SAM2ImagePredictor:
                 self.model.sam_prompt_encoder, (concat_points[0], concat_points[1], mask_input_dummy, masks_enable), 'model/prompt_encoder_'+model_id+'.onnx',
                 input_names=["coords", "labels", "masks", "masks_enable"],
                 output_names=["sparse_embeddings", "dense_embeddings", "dense_pe"],
-                dynamic_axes={
-                    'coords': {0: 'b', 1: 'n'},
-                    'labels': {0: 'b', 1: 'n'},
-                    'masks': {0: 'b', 1: 'h', 2: 'w'},
-                },
+                # dynamic_axes={
+                #     'coords': {0: 'b', 1: 'n'},
+                #     'labels': {0: 'b', 1: 'n'},
+                #     'masks': {0: 'b', 1: 'h', 2: 'w'},
+                # },
                 verbose=False, opset_version=17
             )
 
@@ -592,9 +592,9 @@ class SAM2ImagePredictor:
                 'model/mask_decoder_'+model_id+'.onnx',
                 input_names=["image_embeddings", "image_pe", "sparse_prompt_embeddings", "dense_prompt_embeddings", "repeat_image", "high_res_features1", "high_res_features2"],
                 output_names=["masks", "iou_pred", "sam_tokens_out", "object_score_logits"],
-                dynamic_axes={
-                    'sparse_prompt_embeddings': {1: 'n'},
-                },
+                # dynamic_axes={
+                #     'sparse_prompt_embeddings': {1: 'n'},
+                # },
                 verbose=False, opset_version=17
             )
         
